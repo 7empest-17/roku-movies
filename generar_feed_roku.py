@@ -1,3 +1,4 @@
+import os
 import json
 import re
 import time
@@ -8,22 +9,25 @@ from curl_cffi import requests
 BASE_URL = "https://cinebel.cc"
 AJAX_URL = f"{BASE_URL}/wp-admin/admin-ajax.php"
 
-# Inicializar sesión emulando Chrome 124 con gestión de cookies de paso
+# Lectura de la cookie desde los Secrets del repositorio
+CF_CLEARANCE = os.environ.get("CF_CLEARANCE", "").strip()
+
 session = requests.Session(impersonate="chrome124")
+
 headers_base = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
-    "Referer": "https://www.google.com/"
+    "Referer": "https://cinebel.cc/"
 }
-session.headers.update(headers_base)
 
-def establecer_sesion():
-    try:
-        session.get(BASE_URL, timeout=15)
-        time.sleep(2)
-    except Exception:
-        pass
+if CF_CLEARANCE:
+    headers_base["Cookie"] = f"cf_clearance={CF_CLEARANCE}"
+    print(f"[+] Cookie cf_clearance cargada correctamente ({len(CF_CLEARANCE)} caracteres).")
+else:
+    print("[!] Advertencia: No se detectó la variable CF_CLEARANCE.")
+
+session.headers.update(headers_base)
 
 def obtener_urls_sitemap():
     sitemap_candidates = [
@@ -51,13 +55,13 @@ def resolver_video_rumble(embed_url):
     try:
         res = session.get(embed_url, headers={"Referer": BASE_URL}, timeout=15)
         if res.status_code != 200:
-            print(f"       -> Falló carga embed ({embed_url}) Status: {res.status_code}")
+            print(f"       -> Falló carga embed Status: {res.status_code}")
             return None
 
         html = res.text
         config_match = re.search(r'const\s+configId\s*=\s*["\']([a-zA-Z0-9_-]+)["\']', html)
         if not config_match:
-            print("       -> No se encontró configId en el embed")
+            print("       -> No se encontró configId")
             return None
 
         config_id = config_match.group(1)
@@ -86,14 +90,13 @@ def resolver_video_rumble(embed_url):
 
 def extraer_stream_pelicula(movie_url):
     try:
-        res = session.get(movie_url, headers={"Referer": f"{BASE_URL}/"}, timeout=15)
+        res = session.get(movie_url, headers={"Referer": f"{BASE_URL}/movies/"}, timeout=15)
         if res.status_code != 200:
-            print(f"       -> Falló carga de página HTML (Status: {res.status_code})")
+            print(f"       -> Falló HTML de película (Status: {res.status_code})")
             return None, None, None
 
         soup = BeautifulSoup(res.text, "html.parser")
         
-        # Metadatos para el feed de Roku
         title_tag = soup.select_one("h1, .sheader .data h1")
         title = title_tag.get_text(strip=True) if title_tag else movie_url.rstrip("/").split("/")[-1]
         
@@ -106,7 +109,7 @@ def extraer_stream_pelicula(movie_url):
 
         player_item = soup.select_one("li[data-post][data-nume], div[data-post][data-nume]")
         if not player_item:
-            print("       -> No se encontró elemento player (li/div con data-post)")
+            print("       -> Sin selector dooplay player")
             return None, title, poster
 
         post_id = player_item.get("data-post")
@@ -141,19 +144,18 @@ def extraer_stream_pelicula(movie_url):
         return stream, title, poster
             
     except Exception as e:
-        print(f"       -> Excepción: {e}")
+        print(f"       -> Error general al extraer: {e}")
         
     return None, None, None
 
 def generar_feed(limite_peliculas=15):
-    establecer_sesion()
-    
     movie_links = []
     catalog_url = f"{BASE_URL}/movies/"
     print(f"[-] Intentando catálogo regular: {catalog_url}")
     
     res = session.get(catalog_url, timeout=15)
     if res.status_code == 200:
+        print("[+] Catálogo regular accesible (200 OK).")
         soup = BeautifulSoup(res.text, "html.parser")
         items = soup.select("article.item.movies a, .item.movies a")
         for a in items:
@@ -165,10 +167,10 @@ def generar_feed(limite_peliculas=15):
         movie_links = obtener_urls_sitemap()
 
     if not movie_links:
-        print("[!] No se pudieron extraer URLs del catálogo ni del sitemap.")
+        print("[!] No se pudieron extraer URLs.")
         return
 
-    print(f"[+] Total de títulos localizados: {len(movie_links)}. Procesando los primeros {limite_peliculas}...")
+    print(f"[+] Total de títulos disponibles: {len(movie_links)}. Procesando los primeros {limite_peliculas}...")
 
     peliculas_roku = []
     for movie_url in movie_links[:limite_peliculas]:
@@ -178,7 +180,7 @@ def generar_feed(limite_peliculas=15):
         stream_info, title, poster = extraer_stream_pelicula(movie_url)
         
         if stream_info:
-            print(f"     [OK] Enlace extraído ({stream_info['format'].upper()})")
+            print(f"     [OK] Enlace extraído: {stream_info['url'][:60]}... ({stream_info['format'].upper()})")
             peliculas_roku.append({
                 "id": slug,
                 "title": title or slug,
@@ -195,7 +197,7 @@ def generar_feed(limite_peliculas=15):
     with open("feed_roku.json", "w", encoding="utf-8") as f:
         json.dump(peliculas_roku, f, ensure_ascii=False, indent=2)
 
-    print(f"\n[+] Proceso finalizado. {len(peliculas_roku)} películas guardadas en 'feed_roku.json'.")
+    print(f"\n[+] Finalizado. {len(peliculas_roku)} películas guardadas en 'feed_roku.json'.")
 
 if __name__ == "__main__":
     generar_feed(limite_peliculas=15)
