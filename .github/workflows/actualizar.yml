@@ -20,9 +20,9 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Instalar dependencias del sistema y Playwright
+      - name: Instalar dependencias del sistema y Playwright con Stealth
         run: |
-          pip install playwright beautifulsoup4 requests
+          pip install playwright playwright-stealth beautifulsoup4 requests
           playwright install --with-deps chromium
 
       - name: Ejecutar Extractor con Navegador Real
