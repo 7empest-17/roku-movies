@@ -24,6 +24,8 @@ jobs:
         run: pip install curl_cffi beautifulsoup4
 
       - name: Ejecutar Extractor
+        env:
+          CF_CLEARANCE: ${{ secrets.CF_CLEARANCE }}
         run: python generar_feed_roku.py
 
       - name: Guardar y subir feed actualizado
