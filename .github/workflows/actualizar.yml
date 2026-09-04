@@ -20,13 +20,20 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Instalar dependencias del sistema y Playwright
+      - name: Instalar Google Chrome y Xvfb
         run: |
-          pip install playwright beautifulsoup4 requests
-          playwright install --with-deps chromium
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo apt install -y ./google-chrome-stable_current_amd64.deb
 
-      - name: Ejecutar Extractor con Navegador Real
-        run: python generar_feed_roku.py
+      - name: Instalar dependencias Python
+        run: |
+          pip install seleniumbase beautifulsoup4 requests
+
+      - name: Ejecutar Extractor con Bypass UC
+        run: |
+          xvfb-run --server-args="-screen 0 1920x1080x24" python generar_feed_roku.py
 
       - name: Guardar y subir feed actualizado
         run: |
