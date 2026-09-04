@@ -1,33 +1,12 @@
-import os
 import json
 import re
 import time
 import xml.etree.ElementTree as ET
+import requests
 from bs4 import BeautifulSoup
-from curl_cffi import requests
+from playwright.sync_api import sync_playwright
 
 BASE_URL = "https://cinebel.cc"
-AJAX_URL = f"{BASE_URL}/wp-admin/admin-ajax.php"
-
-# Lectura de la cookie desde los Secrets del repositorio
-CF_CLEARANCE = os.environ.get("CF_CLEARANCE", "").strip()
-
-session = requests.Session(impersonate="chrome124")
-
-headers_base = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
-    "Referer": "https://cinebel.cc/"
-}
-
-if CF_CLEARANCE:
-    headers_base["Cookie"] = f"cf_clearance={CF_CLEARANCE}"
-    print(f"[+] Cookie cf_clearance cargada correctamente ({len(CF_CLEARANCE)} caracteres).")
-else:
-    print("[!] Advertencia: No se detectó la variable CF_CLEARANCE.")
-
-session.headers.update(headers_base)
 
 def obtener_urls_sitemap():
     sitemap_candidates = [
@@ -35,11 +14,10 @@ def obtener_urls_sitemap():
         f"{BASE_URL}/movie-sitemap.xml",
         f"{BASE_URL}/sitemap-movies.xml"
     ]
-    
     urls = []
     for sm_url in sitemap_candidates:
         try:
-            res = session.get(sm_url, timeout=15)
+            res = requests.get(sm_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
             if res.status_code == 200 and "<urlset" in res.text:
                 root = ET.fromstring(res.content)
                 for elem in root.findall(".//{http://www.sitemaps.org/schemas/sitemap/0.9}loc"):
@@ -51,153 +29,144 @@ def obtener_urls_sitemap():
             continue
     return urls
 
-def resolver_video_rumble(embed_url):
+def resolver_video_rumble(context, embed_url):
     try:
-        res = session.get(embed_url, headers={"Referer": BASE_URL}, timeout=15)
-        if res.status_code != 200:
-            print(f"       -> Falló carga embed Status: {res.status_code}")
-            return None
+        page = context.new_page()
+        page.goto(embed_url, wait_until="domcontentloaded", timeout=20000)
+        html = page.content()
+        page.close()
 
-        html = res.text
         config_match = re.search(r'const\s+configId\s*=\s*["\']([a-zA-Z0-9_-]+)["\']', html)
         if not config_match:
-            print("       -> No se encontró configId")
             return None
 
         config_id = config_match.group(1)
         config_url = f"{BASE_URL}/get_video_config.php?id={config_id}"
 
-        cfg_res = session.get(config_url, headers={
-            "Referer": embed_url,
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-            "X-Requested-With": "XMLHttpRequest"
-        }, timeout=15)
-
-        if cfg_res.status_code == 200:
-            data = cfg_res.json()
+        # Realizar fetch dentro del contexto del navegador para mantener cookies/referer
+        page_api = context.new_page()
+        res = page_api.request.get(config_url, headers={"Referer": embed_url})
+        if res.status == 200:
+            data = res.json()
             for source in data.get("sources", []):
                 file_url = source.get("file", "")
                 if file_url and "test-streams.mux.dev" not in file_url:
+                    page_api.close()
                     return {
                         "url": file_url,
                         "format": "hls" if ".m3u8" in file_url else "mp4"
                     }
-        else:
-            print(f"       -> Falló get_video_config.php Status: {cfg_res.status_code}")
+        page_api.close()
     except Exception as e:
         print(f"       -> Error en config: {e}")
     return None
 
-def extraer_stream_pelicula(movie_url):
-    try:
-        res = session.get(movie_url, headers={"Referer": f"{BASE_URL}/movies/"}, timeout=15)
-        if res.status_code != 200:
-            print(f"       -> Falló HTML de película (Status: {res.status_code})")
-            return None, None, None
-
-        soup = BeautifulSoup(res.text, "html.parser")
-        
-        title_tag = soup.select_one("h1, .sheader .data h1")
-        title = title_tag.get_text(strip=True) if title_tag else movie_url.rstrip("/").split("/")[-1]
-        
-        poster_tag = soup.select_one(".poster img, .sheader .poster img")
-        poster = ""
-        if poster_tag:
-            poster = poster_tag.get("data-src") or poster_tag.get("src") or ""
-            if poster.startswith("//"):
-                poster = "https:" + poster
-
-        player_item = soup.select_one("li[data-post][data-nume], div[data-post][data-nume]")
-        if not player_item:
-            print("       -> Sin selector dooplay player")
-            return None, title, poster
-
-        post_id = player_item.get("data-post")
-        nume = player_item.get("data-nume")
-        player_type = player_item.get("data-type", "movie")
-
-        payload = {
-            "action": "doo_player_ajax",
-            "post": post_id,
-            "nume": nume,
-            "type": player_type
-        }
-
-        ajax_res = session.post(AJAX_URL, data=payload, headers={
-            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            "Referer": movie_url,
-            "X-Requested-With": "XMLHttpRequest"
-        }, timeout=15)
-
-        if ajax_res.status_code != 200:
-            print(f"       -> Falló admin-ajax.php (Status: {ajax_res.status_code})")
-            return None, title, poster
-
-        embed_html = ajax_res.json().get("embed_url", "")
-        src_match = re.search(r'src=["\']([^"\']+)["\']', embed_html)
-        iframe_url = src_match.group(1) if src_match else embed_html
-
-        if iframe_url.startswith("//"):
-            iframe_url = "https:" + iframe_url
-
-        stream = resolver_video_rumble(iframe_url)
-        return stream, title, poster
-            
-    except Exception as e:
-        print(f"       -> Error general al extraer: {e}")
-        
-    return None, None, None
-
 def generar_feed(limite_peliculas=15):
-    movie_links = []
-    catalog_url = f"{BASE_URL}/movies/"
-    print(f"[-] Intentando catálogo regular: {catalog_url}")
-    
-    res = session.get(catalog_url, timeout=15)
-    if res.status_code == 200:
-        print("[+] Catálogo regular accesible (200 OK).")
-        soup = BeautifulSoup(res.text, "html.parser")
-        items = soup.select("article.item.movies a, .item.movies a")
-        for a in items:
-            href = a.get("href", "")
-            if href and href not in movie_links and href != catalog_url:
-                movie_links.append(href)
-    else:
-        print(f"[!] Catálogo bloqueado ({res.status_code}). Conectando por sitemap...")
-        movie_links = obtener_urls_sitemap()
+    print("[-] Obteniendo lista de títulos desde el sitemap...")
+    movie_links = obtener_urls_sitemap()
 
     if not movie_links:
-        print("[!] No se pudieron extraer URLs.")
+        print("[!] No se encontraron URLs en los sitemaps.")
         return
 
-    print(f"[+] Total de títulos disponibles: {len(movie_links)}. Procesando los primeros {limite_peliculas}...")
+    print(f"[+] Total de títulos: {len(movie_links)}. Extrayendo los primeros {limite_peliculas}...")
 
     peliculas_roku = []
-    for movie_url in movie_links[:limite_peliculas]:
-        slug = movie_url.rstrip("/").split("/")[-1]
-        print(f"  -> Procesando: {slug}")
-        
-        stream_info, title, poster = extraer_stream_pelicula(movie_url)
-        
-        if stream_info:
-            print(f"     [OK] Enlace extraído: {stream_info['url'][:60]}... ({stream_info['format'].upper()})")
-            peliculas_roku.append({
-                "id": slug,
-                "title": title or slug,
-                "hdPosterUrl": poster,
-                "description": "",
-                "url": stream_info["url"],
-                "streamFormat": stream_info["format"]
-            })
-        else:
-            print("     [x] No disponible")
 
-        time.sleep(1.5)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=[
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox"
+        ])
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 720}
+        )
+        page = context.new_page()
+
+        # Visita inicial a la raíz para superar el reto inicial
+        try:
+            print("[-] Pasando validación inicial en la home...")
+            page.goto(BASE_URL, wait_until="networkidle", timeout=30000)
+            time.sleep(3)
+        except Exception:
+            pass
+
+        for movie_url in movie_links[:limite_peliculas]:
+            slug = movie_url.rstrip("/").split("/")[-1]
+            print(f"  -> Procesando: {slug}")
+
+            try:
+                page.goto(movie_url, wait_until="domcontentloaded", timeout=25000)
+                html = page.content()
+                soup = BeautifulSoup(html, "html.parser")
+
+                title_tag = soup.select_one("h1, .sheader .data h1")
+                title = title_tag.get_text(strip=True) if title_tag else slug
+
+                poster_tag = soup.select_one(".poster img, .sheader .poster img")
+                poster = ""
+                if poster_tag:
+                    poster = poster_tag.get("data-src") or poster_tag.get("src") or ""
+                    if poster.startswith("//"):
+                        poster = "https:" + poster
+
+                player_item = soup.select_one("li[data-post][data-nume], div[data-post][data-nume]")
+                if not player_item:
+                    print("       -> No se encontró elemento player")
+                    continue
+
+                post_id = player_item.get("data-post")
+                nume = player_item.get("data-nume")
+                player_type = player_item.get("data-type", "movie")
+
+                # Petición AJAX desde el contexto del navegador
+                ajax_res = page.request.post(
+                    f"{BASE_URL}/wp-admin/admin-ajax.php",
+                    form={
+                        "action": "doo_player_ajax",
+                        "post": post_id,
+                        "nume": nume,
+                        "type": player_type
+                    },
+                    headers={"Referer": movie_url}
+                )
+
+                if ajax_res.status == 200:
+                    embed_html = ajax_res.json().get("embed_url", "")
+                    src_match = re.search(r'src=["\']([^"\']+)["\']', embed_html)
+                    iframe_url = src_match.group(1) if src_match else embed_html
+
+                    if iframe_url.startswith("//"):
+                        iframe_url = "https:" + iframe_url
+
+                    stream_info = resolver_video_rumble(context, iframe_url)
+                    if stream_info:
+                        print(f"     [OK] Enlace extraído ({stream_info['format'].upper()})")
+                        peliculas_roku.append({
+                            "id": slug,
+                            "title": title,
+                            "hdPosterUrl": poster,
+                            "description": "",
+                            "url": stream_info["url"],
+                            "streamFormat": stream_info["format"]
+                        })
+                    else:
+                        print("     [x] No se pudo resolver URL de Rumble")
+                else:
+                    print(f"       -> Falló admin-ajax.php (Status: {ajax_res.status})")
+
+            except Exception as e:
+                print(f"       -> Error procesando película: {e}")
+
+            time.sleep(1)
+
+        browser.close()
 
     with open("feed_roku.json", "w", encoding="utf-8") as f:
         json.dump(peliculas_roku, f, ensure_ascii=False, indent=2)
 
-    print(f"\n[+] Finalizado. {len(peliculas_roku)} películas guardadas en 'feed_roku.json'.")
+    print(f"\n[+] Proceso finalizado. {len(peliculas_roku)} películas guardadas en 'feed_roku.json'.")
 
 if __name__ == "__main__":
     generar_feed(limite_peliculas=15)
